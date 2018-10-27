@@ -7,62 +7,78 @@ if [ "$#" -ne 1 ]; then
 fi
 
 GUID=$1
-echo "Setting up Nexus in project $GUID-nexus"
+NEXUS=$GUID-nexus
+echo "Setting up Nexus in project ${NEXUS}"
 
-# Code to set up the Nexus. It will need to
-# * Create Nexus
-# * Set the right options for the Nexus Deployment Config
-# * Load Nexus with the right repos
-# * Configure Nexus as a docker registry
-# Hint: Make sure to wait until Nexus if fully up and running
-#       before configuring nexus with repositories.
-#       You could use the following code:
-# while : ; do
-#   echo "Checking if Nexus is Ready..."
-#   oc get pod -n ${GUID}-nexus|grep '\-2\-'|grep -v deploy|grep "1/1"
-#   [[ "$?" == "1" ]] || break
-#   echo "...no. Sleeping 10 seconds."
-#   sleep 10
-# done
+# Change to the correct project
+oc project ${NEXUS}
 
-# Ideally just calls a template
-# oc new-app -f ../templates/nexus.yaml --param .....
-
-# To be Implemented by Student
-
-##################################################################
+oc new-app sonatype/nexus3:latest -n ${NEXUS}
+oc expose svc nexus3 -n ${NEXUS}
+oc rollout pause dc nexus3 -n ${NEXUS}
 
 
+oc patch dc nexus3 --patch='{ "spec": { "strategy": { "type": "Recreate" }}}' -n ${NEXUS}
+oc set resources dc nexus3 --limits=memory=2Gi,cpu=1000m --requests=memory=1Gi,cpu=500m -n ${NEXUS}
 
-# Ensure that we are creating the objects in the correct project
-oc project ${GUID}-nexus
+# Create persistent volume mount
+echo "apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nexus-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 4Gi" | oc create -f - -n ${NEXUS}
 
-# Call template to provision nexus objects
-oc new-app -f Infrastructure/templates/nexus3.yaml -p GUID=${GUID} -p CPU_LIMITS=1000m -p MEM_REQUESTS=1Gi -p MEM_LIMITS=2Gi -p VOLUME_CAPACITY=2G -n ${GUID}-nexus
+oc set volume dc/nexus3 --add \
+	--overwrite \
+	--name=nexus3-volume-1 \
+	--mount-path=/nexus-data/ \
+	--type persistentVolumeClaim \
+	--claim-name=nexus-pvc \
+	-n ${NEXUS}
 
-# Wait for nexus to start before we configure it
-while : ; do
-  echo "Checking if Nexus is Ready..."
-  oc get pod -n ${GUID}-nexus|grep -v deploy|grep "1/1"
-  [[ "$?" == "1" ]] || break
-  echo "...no. Sleeping 10 seconds."
-  sleep 10
+oc set probe dc/nexus3 \
+	--liveness \
+	--failure-threshold 3 \
+	--initial-delay-seconds 60 \
+	-- echo ok \
+	-n ${NEXUS}
+	
+oc set probe dc/nexus3 \
+	--readiness \
+	--failure-threshold 3 \
+	--initial-delay-seconds 60 \
+	--get-url=http://:8081/repository/maven-public/ \
+	-n ${NEXUS}
+	
+oc rollout resume dc nexus3 -n ${NEXUS}
+oc rollout status dc/nexus3 --watch -n ${NEXUS}
+    
+http_status=""
+while : ; do  
+  echo "Checking if Nexus is up."
+  http_status=$(curl -I http://$(oc get route nexus3 --template='{{ .spec.host }}' -n ${NEXUS})/repository/maven-public/ -o /dev/null -w '%{http_code}\n' -s)
+  echo "Http call returned code: ${http_status}"	
+  [[ "$http_status" != "200" ]] || break
+  echo "Sleeping 20 seconds...."    
+  sleep 20
 done
 
-#Make sure that route has started routing traffic, so sleep a little longer
-sleep 5
+curl -o setup_nexus3.sh -s https://raw.githubusercontent.com/wkulhanek/ocp_advanced_development_resources/master/nexus/setup_nexus3.sh
+chmod +x setup_nexus3.sh
+./setup_nexus3.sh admin admin123 http://$(oc get route nexus3 -n ${NEXUS} --template='{{ .spec.host }}')
+rm setup_nexus3.sh
 
-# Run configuration script to configure redhat maven repos, create release repo, configure proxy for maven, setup docker registry repo
-curl -o config_nexus_tmp.sh -s https://raw.githubusercontent.com/bentaljaard/rh_appdev_homework/master/Infrastructure/bin/config_nexus3.sh
-chmod +x config_nexus_tmp.sh
-./config_nexus_tmp.sh admin admin123 http://$(oc get route nexus3 --template='{{ .spec.host }}' -n ${GUID}-nexus)
-rm config_nexus_tmp.sh
+oc expose dc nexus3 --port=5000 --name=nexus-registry -n ${NEXUS}
+oc create route edge nexus-registry --service=nexus-registry --port=5000 -n ${NEXUS}
 
-echo "************************"
-echo "Nexus setup complete"
-echo "************************"
+oc get routes -n ${NEXUS}
 
-exit 0
+oc annotate route nexus3 console.alpha.openshift.io/overview-app-route=true -n ${NEXUS}
+oc annotate route nexus-registry console.alpha.openshift.io/overview-app-route=false -n ${NEXUS}
 
-
-
+echo "${NEXUS} completed successfully"
